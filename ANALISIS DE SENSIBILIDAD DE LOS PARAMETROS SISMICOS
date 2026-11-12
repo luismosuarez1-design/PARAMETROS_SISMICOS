@@ -1,0 +1,799 @@
+# ============================================================
+# ANALISIS DE SENSIBILIDAD DE LOS PARAMETROS SISMICOS
+# ============================================================
+
+from pathlib import Path
+from collections import Counter
+import numpy as np
+import pandas as pd
+
+from scipy.optimize import least_squares
+from scipy.stats import norm
+from scipy.special import gammaln
+
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# CONFIGURACION
+# ============================================================
+CARPETA = Path(".")
+PATRON = "DATOS{}.xlsx"
+N_ARCHIVOS = 13
+
+HOJA = 0
+COLUMNA_MAGNITUD = "Mw_Homogeneizado"
+COLUMNA_TIEMPO = "DecimalYear"
+
+DM = 0.1
+M_INICIAL = 3.2
+M_FINAL = 6.6
+dM = 0.1
+Mc_values = np.round(np.arange(4.0, 6.05, 0.1), 1)
+
+N_MIN = 20
+GFT_MIN = 90.0
+DELTA_B_MAX = 5.0
+CV_B_MAX = 10.0
+MC_ESTABILIDAD_MIN = 3.5
+
+CARPETA_FIGURAS = Path("Figuras_EMR")
+CARPETA_FIGURAS.mkdir(exist_ok=True)
+
+
+# ============================================================
+# FUNCIONES AUXILIARES
+# ============================================================
+def limpiar_magnitud(serie):
+    if pd.api.types.is_numeric_dtype(serie):
+        return pd.to_numeric(serie, errors="coerce")
+    s = serie.astype(str).str.strip()
+    s = s.str.replace(r"(?<=\d),(?=\d)", ".", regex=True)
+    return pd.to_numeric(s, errors="coerce")
+
+
+def ajustar_mu_sigma(M, n_obs, Mc):
+    mask_low = M < Mc
+    M_low = M[mask_low]
+    n_low = n_obs[mask_low]
+    if len(M_low) < 4:
+        return None
+    Nmax = np.max(n_low)
+    if Nmax <= 0:
+        return None
+    P_obs = n_low / Nmax
+    mask_fit = n_low != 0
+    M_fit = M_low[mask_fit]
+    P_fit = P_obs[mask_fit]
+    if len(M_fit) < 3:
+        return None
+
+    def residuals(params):
+        mu, sigma = params
+        if sigma <= 0:
+            return np.ones(len(M_fit)) * 1e6
+        return norm.cdf(M_fit, loc=mu, scale=sigma) - P_fit
+
+    mu0 = Mc - 0.4
+    sigma0 = 0.5
+    lower_bounds = [np.min(M_low) - 1.0, 0.01]
+    upper_bounds = [Mc + 1.0, 2.0]
+
+    result = least_squares(residuals, x0=[mu0, sigma0],
+                           bounds=(lower_bounds, upper_bounds),
+                           max_nfev=10000)
+    mu, sigma = result.x
+    P_model = norm.cdf(M_fit, loc=mu, scale=sigma)
+    residual = P_model - P_fit
+    SSE = np.sum(residual ** 2)
+    RMSE = np.sqrt(SSE / len(M_fit))
+    MAE = np.mean(np.abs(residual))
+    return {"mu": mu, "sigma": sigma, "Nmax": Nmax,
+            "SSE": SSE, "RMSE": RMSE, "MAE": MAE,
+            "n_points": len(M_fit)}
+
+
+def calcular_GR(M, n_obs, Mc):
+    threshold = Mc - dM / 2
+    mask = M > threshold
+    M_gr = M[mask]
+    n_gr = n_obs[mask]
+    N_total = np.sum(n_gr)
+    if N_total <= 0:
+        return None
+    mean_M = np.sum(M_gr * n_gr) / N_total
+    b = np.log10(np.e) / (mean_M - threshold)
+    a = np.log10(N_total) + b * Mc
+    Nc = 10 ** (a - b * Mc)
+    return {"b": b, "a": a, "Nc": Nc, "N_complete": N_total}
+
+
+def construir_modelo(M, n_obs, Mc, mu, sigma, Nmax, b, Nc):
+    P = norm.cdf(M, loc=mu, scale=sigma)
+    n_incomplete = Nmax * P
+    N_GR = Nc * 10 ** (-b * (M - Mc))
+    N_GR_next = Nc * 10 ** (-b * ((M + dM) - Mc))
+    n_GR = N_GR - N_GR_next
+    n_model = np.where(M < Mc, n_incomplete, n_GR)
+    N_model_acum = np.cumsum(n_model[::-1])[::-1]
+    return {"P": P, "n_model": n_model, "N_model_acum": N_model_acum}
+
+
+def poisson_nll(n_obs, n_model):
+    lam = np.maximum(n_model, 1e-12)
+    logL = np.sum(n_obs * np.log(lam) - lam - gammaln(n_obs + 1))
+    return -logL
+
+
+# ============================================================
+# PROCESAR UN ARCHIVO
+# ============================================================
+def procesar_archivo(ruta_excel):
+    print("\n" + "#" * 70)
+    print(f"# PROCESANDO: {ruta_excel.name}")
+    print("#" * 70)
+
+    df_cat = pd.read_excel(ruta_excel, sheet_name=HOJA)
+    df_cat.columns = df_cat.columns.astype(str).str.strip()
+
+    col_mag = COLUMNA_MAGNITUD
+    if col_mag not in df_cat.columns:
+        posibles = [c for c in df_cat.columns
+                    if any(p in c.lower() for p in ("mw", "magnitud", "magnitude"))]
+        if len(posibles) == 1:
+            col_mag = posibles[0]
+        else:
+            raise ValueError(
+                f"[{ruta_excel.name}] No se encontró columna de magnitud. "
+                f"Columnas: {df_cat.columns.tolist()}"
+            )
+
+    mag = limpiar_magnitud(df_cat[col_mag]).dropna().to_numpy(float)
+    mag = mag[np.isfinite(mag)]
+    if len(mag) == 0:
+        raise ValueError(f"[{ruta_excel.name}] Sin datos válidos.")
+
+    print(f"  Eventos válidos: {len(mag)}")
+    print(f"  Magnitud mínima: {mag.min():.2f}")
+    print(f"  Magnitud máxima: {mag.max():.2f}")
+
+    # Vectores
+    M = np.round(np.arange(M_INICIAL, M_FINAL + DM / 2, DM), 1)
+    bordes = np.r_[M - DM / 2, M[-1] + DM / 2]
+    n_obs, _ = np.histogram(mag, bins=bordes)
+    Nobs = np.array([np.sum(mag >= (mc - DM / 2)) for mc in M], dtype=int)
+
+    # EMR malla 4.0 - 6.0
+    resultados = []
+    modelos = {}
+    for Mc in Mc_values:
+        ajuste = ajustar_mu_sigma(M, n_obs, Mc)
+        if ajuste is None:
+            continue
+        gr = calcular_GR(M, n_obs, Mc)
+        if gr is None:
+            continue
+        modelo = construir_modelo(M, n_obs, Mc,
+                                  ajuste["mu"], ajuste["sigma"], ajuste["Nmax"],
+                                  gr["b"], gr["Nc"])
+        NLL = poisson_nll(n_obs, modelo["n_model"])
+        error = modelo["n_model"] - n_obs
+
+        resultados.append({
+            "Mc": Mc,
+            "mu": ajuste["mu"], "sigma": ajuste["sigma"],
+            "SSE_incompleto": ajuste["SSE"],
+            "RMSE_incompleto": ajuste["RMSE"],
+            "MAE_incompleto": ajuste["MAE"],
+            "n_puntos_incompleto": ajuste["n_points"],
+            "Nmax": ajuste["Nmax"],
+            "b": gr["b"], "a": gr["a"], "Nc": gr["Nc"],
+            "N_completo": gr["N_complete"],
+            "SSE_global": np.sum(error ** 2),
+            "RMSE_global": np.sqrt(np.mean(error ** 2)),
+            "MAE_global": np.mean(np.abs(error)),
+            "NLL_Poisson": NLL,
+        })
+        modelos[Mc] = modelo
+
+    resultados_df = pd.DataFrame(resultados)
+    if resultados_df.empty:
+        raise ValueError(f"[{ruta_excel.name}] EMR sin resultados.")
+
+    # Candidatas EMR
+    fila_SSE = resultados_df.loc[resultados_df["SSE_incompleto"].idxmin()]
+    fila_NLL = resultados_df.loc[resultados_df["NLL_Poisson"].idxmin()]
+    Mc_SSE = float(fila_SSE["Mc"])
+    Mc_NLL = float(fila_NLL["Mc"])
+
+    # Métodos clásicos
+    M_met = np.round(np.arange(2.6, 8.4 + DM / 2, DM), 1)
+    bordes_met = np.r_[M_met - DM / 2, M_met[-1] + DM / 2]
+    n_obs_met, _ = np.histogram(mag, bins=bordes_met)
+    N_acum_met = np.array([np.sum(mag >= (mc - DM / 2)) for mc in M_met], dtype=int)
+
+    def _fila_metodo(mc):
+        limite = mc - DM / 2
+        sel = mag[mag >= limite]
+        Nc = len(sel)
+        fila = {
+            "Mc": float(mc), "Nc": int(Nc),
+            "b": np.nan, "sigma_b": np.nan,
+            "Delta_b_%": np.nan, "CVb_%": np.nan, "GFT_%": np.nan,
+            "Estabilidad": "NO USAR: N<20" if Nc < N_MIN else "REVISAR",
+        }
+        if Nc < 2:
+            return fila
+        Mprom = float(np.mean(sel))
+        SS = float(np.sum((sel - Mprom) ** 2))
+        den = Mprom - limite
+        if den <= 0:
+            return fila
+        b = np.log10(np.e) / den
+        sigma_b = 2.30 * b ** 2 * np.sqrt(SS / (Nc * (Nc - 1)))
+        CVb = 100 * sigma_b / b if b > 0 else np.nan
+        mask = M_met >= mc
+        M_eval = M_met[mask]
+        Nobs_eval = N_acum_met[mask].astype(float)
+        if len(M_eval) >= 1 and np.sum(Nobs_eval) > 0:
+            Nfit = Nc * 10 ** (-b * (M_eval - mc))
+            GFT = 100 * (1 - np.sum(np.abs(Nobs_eval - Nfit)) / np.sum(Nobs_eval))
+        else:
+            GFT = np.nan
+        fila.update({"b": float(b), "sigma_b": float(sigma_b),
+                     "CVb_%": float(CVb), "GFT_%": float(GFT)})
+        return fila
+
+    res_met = pd.DataFrame([_fila_metodo(mc) for mc in M_met])
+    for i in range(1, len(res_met)):
+        b0, b1 = res_met.loc[i - 1, "b"], res_met.loc[i, "b"]
+        if pd.notna(b0) and pd.notna(b1) and b0 > 0 and b1 > 0:
+            res_met.loc[i, "Delta_b_%"] = abs(b1 - b0) / b0 * 100
+    for i, f in res_met.iterrows():
+        if f["Mc"] < MC_ESTABILIDAD_MIN:
+            et = "NO EVALUADO"
+        elif f["Nc"] < N_MIN:
+            et = "NO USAR: N<20"
+        elif (pd.notna(f["Delta_b_%"]) and pd.notna(f["CVb_%"])
+              and f["Delta_b_%"] <= DELTA_B_MAX and f["CVb_%"] <= CV_B_MAX):
+            et = "ZONA ESTABLE"
+        else:
+            et = "REVISAR"
+        res_met.loc[i, "Estabilidad"] = et
+
+    Mc_MAXC = float(M_met[int(np.argmax(n_obs_met))])
+
+    cand_gft = res_met[(res_met["Mc"] >= MC_ESTABILIDAD_MIN)
+                       & (res_met["Nc"] >= N_MIN)
+                       & (res_met["GFT_%"] >= GFT_MIN)].sort_values("Mc")
+    if not cand_gft.empty:
+        Mc_GFT = float(cand_gft.iloc[0]["Mc"])
+    else:
+        cand_gft_max = res_met[(res_met["Mc"] >= MC_ESTABILIDAD_MIN)
+                               & (res_met["Nc"] >= N_MIN)].sort_values(
+            "GFT_%", ascending=False)
+        Mc_GFT = float(cand_gft_max.iloc[0]["Mc"]) if not cand_gft_max.empty else np.nan
+
+    estables_met = res_met[res_met["Estabilidad"] == "ZONA ESTABLE"].sort_values("Mc")
+    Mc_ESTABILIDAD = float(estables_met["Mc"].median()) if not estables_met.empty else np.nan
+
+    # ========================================================
+    # TABLA COMPARATIVA DE METODOS PARA CADA ZONA
+    # ========================================================
+
+    # Resultado GFT en la magnitud seleccionada
+    fila_gft = res_met.loc[
+        np.isclose(res_met["Mc"], Mc_GFT)
+    ] if np.isfinite(Mc_GFT) else pd.DataFrame()
+
+    if not fila_gft.empty:
+        GFT_seleccionado = float(fila_gft.iloc[0]["GFT_%"])
+    else:
+        GFT_seleccionado = np.nan
+
+    GFT_cumple_90 = (
+        bool(GFT_seleccionado >= GFT_MIN)
+        if np.isfinite(GFT_seleccionado)
+        else False
+    )
+
+    # Parámetros representativos de la zona estable de b
+    if not estables_met.empty:
+        b_estable = float(estables_met["b"].mean())
+        CVb_estable = float(estables_met["CVb_%"].mean())
+    else:
+        b_estable = np.nan
+        CVb_estable = np.nan
+
+    # EMR: Mc correspondiente al mínimo NLL de Poisson
+    Mc_EMR = Mc_NLL
+
+    tabla_comparativa = pd.DataFrame([{
+        "Zona": ruta_excel.stem,
+        "N_eventos": len(mag),
+
+        "Mc_MAXC": Mc_MAXC,
+
+        "Mc_GFT": Mc_GFT,
+        "GFT_%": GFT_seleccionado,
+        "GFT_cumple_90%": GFT_cumple_90,
+
+        "Mc_EMR": Mc_EMR,
+
+        "Mc_SSE": Mc_SSE,
+        "SSE_minimo": float(fila_SSE["SSE_incompleto"]),
+
+        "NLL_minimo": float(fila_NLL["NLL_Poisson"]),
+
+        "Mc_Estabilidad_b": Mc_ESTABILIDAD,
+        "b_estable_promedio": b_estable,
+        "CVb_estable_%": CVb_estable
+    }])
+
+    # Ajuste EMR para métodos si faltan
+    Mc_metodos = []
+    for _mc in [Mc_MAXC, Mc_GFT, Mc_ESTABILIDAD]:
+        if pd.notna(_mc) and _mc not in Mc_metodos:
+            Mc_metodos.append(float(_mc))
+
+    for Mc in Mc_metodos:
+        if np.any(np.isclose(resultados_df["Mc"], Mc)):
+            continue
+        ajuste = ajustar_mu_sigma(M, n_obs, Mc)
+        if ajuste is None:
+            continue
+        gr = calcular_GR(M, n_obs, Mc)
+        if gr is None:
+            continue
+        modelo = construir_modelo(M, n_obs, Mc,
+                                  ajuste["mu"], ajuste["sigma"], ajuste["Nmax"],
+                                  gr["b"], gr["Nc"])
+        NLL = poisson_nll(n_obs, modelo["n_model"])
+        error = modelo["n_model"] - n_obs
+
+        fila = {
+            "Mc": Mc,
+            "mu": ajuste["mu"], "sigma": ajuste["sigma"],
+            "SSE_incompleto": ajuste["SSE"],
+            "RMSE_incompleto": ajuste["RMSE"],
+            "MAE_incompleto": ajuste["MAE"],
+            "n_puntos_incompleto": ajuste["n_points"],
+            "Nmax": ajuste["Nmax"],
+            "b": gr["b"], "a": gr["a"], "Nc": gr["Nc"],
+            "N_completo": gr["N_complete"],
+            "SSE_global": np.sum(error ** 2),
+            "RMSE_global": np.sqrt(np.mean(error ** 2)),
+            "MAE_global": np.mean(np.abs(error)),
+            "NLL_Poisson": NLL,
+        }
+        resultados_df = pd.concat([resultados_df, pd.DataFrame([fila])],
+                                  ignore_index=True)
+        modelos[Mc] = modelo
+
+    resultados_df = resultados_df.sort_values("Mc").reset_index(drop=True)
+
+    # Candidatas finales
+    metodos_graficar = [
+        {"nombre": "mín.SSE", "Mc": Mc_SSE,         "color": "tab:orange", "ls": "--"},
+        {"nombre": "mín.NLL", "Mc": Mc_NLL,         "color": "tab:blue",   "ls": "--"},
+        {"nombre": "MAXC",    "Mc": Mc_MAXC,        "color": "tab:cyan",   "ls": "--"},
+        {"nombre": "GFT",     "Mc": Mc_GFT,         "color": "tab:green",  "ls": "--"},
+        {"nombre": "Estab.b", "Mc": Mc_ESTABILIDAD, "color": "tab:red",    "ls": "--"},
+    ]
+    metodos_graficar = [m for m in metodos_graficar if pd.notna(m["Mc"])]
+    for m in metodos_graficar:
+        m["etiqueta"] = f"EMR, Mc={m['Mc']:.1f} ({m['nombre']})"
+
+    nombres_metodos = [m["nombre"] for m in metodos_graficar]
+    valores_Mc     = [m["Mc"]     for m in metodos_graficar]
+
+    Mc_redondeados = [round(mc, 1) for mc in valores_Mc]
+    conteo = Counter(Mc_redondeados)
+
+    max_votos = max(conteo.values())
+    Mc_ganadores = [mc for mc, n in conteo.items() if n == max_votos]
+    Mc_ELEGIDA = float(np.mean(Mc_ganadores))
+
+    metodos_ganadores = [
+        nombres_metodos[i] for i, mc in enumerate(valores_Mc)
+        if round(mc, 1) in Mc_ganadores
+    ]
+    NOMBRE_ELEGIDO = f"voto ({max_votos}: {', '.join(metodos_ganadores)})"
+
+    print(f"  Mc elegida = {Mc_ELEGIDA:.2f}  [{NOMBRE_ELEGIDO}]")
+
+    # Parámetros sísmicos
+    def _obtener_o_ajustar(Mc_target):
+        fila = resultados_df.loc[np.isclose(resultados_df["Mc"], Mc_target)]
+        if not fila.empty:
+            return fila.iloc[0]
+        ajuste = ajustar_mu_sigma(M, n_obs, Mc_target)
+        if ajuste is None:
+            raise ValueError(f"No se pudo ajustar para Mc={Mc_target:.2f}")
+        gr = calcular_GR(M, n_obs, Mc_target)
+        if gr is None:
+            raise ValueError(f"No se pudo calcular GR para Mc={Mc_target:.2f}")
+        return pd.Series({
+            "Mc": Mc_target,
+            "mu": ajuste["mu"], "sigma": ajuste["sigma"],
+            "b": gr["b"], "a": gr["a"], "Nc": gr["Nc"],
+            "N_completo": gr["N_complete"],
+            "SSE_incompleto": ajuste["SSE"],
+            "SSE_global": np.nan,
+            "NLL_Poisson": np.nan,
+        })
+
+    fila_sel = _obtener_o_ajustar(Mc_ELEGIDA)
+
+    mu_sel    = float(fila_sel["mu"])
+    sigma_sel = float(fila_sel["sigma"])
+    b_sel     = float(fila_sel["b"])
+    a_sel     = float(fila_sel["a"])
+    Nc_sel    = float(fila_sel["Nc"])
+    beta_sel  = b_sel * np.log(10.0)
+
+    if COLUMNA_TIEMPO in df_cat.columns:
+        anios = pd.to_numeric(
+            df_cat[COLUMNA_TIEMPO].astype(str).str.replace(",", ".", regex=False),
+            errors="coerce"
+        ).dropna().to_numpy(float)
+        T_obs = float(anios.max() - anios.min())
+        if T_obs <= 0:
+            T_obs = 1.0
+    else:
+        T_obs = 1.0
+
+    lambda_sel = Nc_sel / T_obs
+
+    resumen_metodos = pd.DataFrame({
+        "Archivo": ruta_excel.name,
+        "Método":  nombres_metodos,
+        "Mc":      valores_Mc,
+    })
+
+    tabla_parametros = pd.DataFrame([{
+        "Archivo":      ruta_excel.name,
+        "N_eventos":    len(mag),
+        "M_min":        mag.min(),
+        "M_max":        mag.max(),
+        "Mc":           Mc_ELEGIDA,
+        "a":            a_sel,
+        "b":            b_sel,
+        "beta":         beta_sel,
+        "lambda":       lambda_sel,
+        "Nc":           Nc_sel,
+        "T_obs_anios":  T_obs,
+        "mu":           mu_sel,
+        "sigma":        sigma_sel,
+        "Metodo_Mc":    NOMBRE_ELEGIDO,
+    }])
+    tabla_GFT = res_met[["Mc", "Nc", "GFT_%"]].copy()
+    return {
+        "resumen_metodos":  resumen_metodos,
+        "tabla_parametros": tabla_parametros,
+        "tabla_comparativa": tabla_comparativa,
+        "nombre_elegido":   NOMBRE_ELEGIDO,
+        "resultados_df":    resultados_df,
+        "modelos":          modelos,
+        "metodos_graficar": metodos_graficar,
+        "M":                M,
+        "n_obs":            n_obs,
+        "Nobs":             Nobs,
+        "tabla_GFT":        tabla_GFT,
+        "Mc_GFT":           Mc_GFT,
+    }
+
+
+# ============================================================
+# FIGURA 3x2 INDIVIDUAL POR ARCHIVO
+# ============================================================
+def generar_figura_individual(res, ruta_excel, carpeta_salida):
+    M               = res["M"]
+    n_obs           = res["n_obs"]
+    Nobs            = res["Nobs"]
+    resultados_df   = res["resultados_df"]
+    modelos         = res["modelos"]
+    metodos_graficar= res["metodos_graficar"]
+    tabla_GFT = res["tabla_GFT"]
+    Mc_GFT = res["Mc_GFT"]
+
+    plt.rcParams.update({
+        "font.family": "serif", "font.size": 10,
+        "axes.labelsize": 10, "axes.titlesize": 11,
+        "legend.fontsize": 8,
+        "xtick.labelsize": 9, "ytick.labelsize": 9,
+        "lines.linewidth": 1.7,
+        "figure.dpi": 120, "savefig.dpi": 300,
+        "axes.grid": True, "grid.alpha": 0.25,
+    })
+
+    fig, axs = plt.subplots(3, 2, figsize=(14, 15))
+    axA, axB, axC, axD, axE, axF = (axs[0,0], axs[0,1], axs[1,0],
+                                     axs[1,1], axs[2,0], axs[2,1])
+
+    fila_SSE = resultados_df.loc[resultados_df["SSE_incompleto"].idxmin()]
+    fila_NLL = resultados_df.loc[resultados_df["NLL_Poisson"].idxmin()]
+    Mc_SSE = float(fila_SSE["Mc"])
+    Mc_NLL = float(fila_NLL["Mc"])
+
+    # (a)
+    axA.plot(M, n_obs, color="black", marker="o", markersize=3.5,
+             linewidth=1.6, label="Frecuencia observada")
+    for m in metodos_graficar:
+        clave = next((k for k in modelos if np.isclose(float(k), m["Mc"])), None)
+        if clave is None:
+            continue
+        axA.plot(M, modelos[clave]["n_model"],
+                 color=m["color"], linestyle=m["ls"],
+                 linewidth=2, label=m["etiqueta"])
+    axA.set_xlabel("Magnitud, M")
+    axA.set_ylabel("Frecuencia de eventos, n(M)")
+    axA.set_title("(a) Frecuencias observadas y modelos EMR")
+    axA.legend(ncol=2, fontsize=7)
+    axA.grid(True, alpha=0.25)
+
+    # (b)
+    Mc_ref = 4.8
+    mask_obs = M < Mc_ref
+    if np.any(mask_obs) and np.max(n_obs[mask_obs]) > 0:
+        P_obs = n_obs[mask_obs] / np.max(n_obs[mask_obs])
+        axB.scatter(M[mask_obs], P_obs, color="black", marker="o", s=30,
+                    zorder=5, label=f"Datos norm. (M < {Mc_ref})")
+    for m in metodos_graficar:
+        fila = resultados_df.loc[np.isclose(resultados_df["Mc"], m["Mc"])]
+        if fila.empty:
+            continue
+        mu_i = float(fila.iloc[0]["mu"])
+        sigma_i = float(fila.iloc[0]["sigma"])
+        if not np.isfinite(sigma_i) or sigma_i <= 0:
+            continue
+        P_model = norm.cdf(M, loc=mu_i, scale=sigma_i)
+        axB.plot(M, P_model, color=m["color"], linestyle=m["ls"],
+                 linewidth=2, label=m["etiqueta"])
+    axB.axhline(0.5, color="gray", linestyle=":", linewidth=1.2, label="P(M)=0.5")
+    axB.set_xlabel("Magnitud, M")
+    axB.set_ylabel("Probabilidad de completitud, P(M)")
+    axB.set_ylim(-0.02, 1.05)
+    axB.set_title("(b) Funciones de completitud candidatas")
+    axB.legend(ncol=2, fontsize=7)
+    axB.grid(True, alpha=0.25)
+
+    # (c)
+    axC.plot(M, Nobs, color="black", marker="o", markersize=3,
+             linewidth=1.7, label="Acumulado observado")
+    for m in metodos_graficar:
+        clave = next((k for k in modelos if np.isclose(float(k), m["Mc"])), None)
+        if clave is None:
+            continue
+        axC.plot(M, modelos[clave]["N_model_acum"],
+                 color=m["color"], linestyle=m["ls"],
+                 linewidth=2, label=m["etiqueta"])
+    axC.set_xlabel("Magnitud, M")
+    axC.set_ylabel("Número acumulado de eventos")
+    axC.set_title("(c) Distribución acumulada")
+    axC.legend(ncol=2, fontsize=7)
+    axC.grid(True, alpha=0.25)
+
+    # (d)
+    axD.plot(resultados_df["Mc"], resultados_df["SSE_incompleto"],
+             color="darkgreen", marker="o", markersize=3.5,
+             linewidth=1.6, label="SSE incompleto")
+    for m in metodos_graficar:
+        fila = resultados_df.loc[np.isclose(resultados_df["Mc"], m["Mc"])]
+        if fila.empty:
+            continue
+        axD.scatter(m["Mc"], float(fila.iloc[0]["SSE_incompleto"]),
+                    color=m["color"], marker="D", s=75, zorder=5,
+                    edgecolor="white", linewidth=1.2,
+                    label=m["etiqueta"])
+    axD.set_xlabel("Magnitud de completitud, Mc")
+    axD.set_ylabel("SSE de la parte incompleta")
+    axD.set_title("(d) Selección por ajuste de P(M)")
+    axD.legend(ncol=1, fontsize=7)
+    axD.grid(True, alpha=0.25)
+
+    # (e)
+    axE.plot(resultados_df["Mc"], resultados_df["NLL_Poisson"],
+             color="navy", marker="o", markersize=3.5,
+             linewidth=1.6, label="NLL de Poisson")
+    for m in metodos_graficar:
+        fila = resultados_df.loc[np.isclose(resultados_df["Mc"], m["Mc"])]
+        if fila.empty:
+            continue
+        axE.scatter(m["Mc"], float(fila.iloc[0]["NLL_Poisson"]),
+                    color=m["color"], marker="D", s=75, zorder=5,
+                    edgecolor="white", linewidth=1.2,
+                    label=m["etiqueta"])
+    axE.set_xlabel("Magnitud de completitud, Mc")
+    axE.set_ylabel("NLL de Poisson")
+    axE.set_title("(e) Evaluación global del modelo")
+    axE.legend(ncol=1, fontsize=7)
+    axE.grid(True, alpha=0.25)
+
+    # (e) GFT - GOODNESS OF FIT TEST
+
+    if not tabla_GFT.empty:
+        axE.plot(
+            tabla_GFT["Mc"],
+            tabla_GFT["GFT_%"],
+            color="darkgreen",
+            marker="o",
+            markersize=3.5,
+            linewidth=1.6,
+            label="GFT"
+        )
+
+    # Umbral mínimo de aceptación del 90 %
+    axE.axhline(
+        GFT_MIN,
+        color="gray",
+        linestyle=":",
+        linewidth=1.4,
+        label=f"Umbral de aceptación = {GFT_MIN:.0f}%"
+    )
+
+    # Magnitud de completitud seleccionada por GFT
+    if np.isfinite(Mc_GFT):
+        axE.axvline(
+            Mc_GFT,
+            color="tab:green",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"$M_c$ GFT = {Mc_GFT:.1f}"
+        )
+
+    axE.set_xlabel("Magnitud de corte, $M_{co}$")
+    axE.set_ylabel("Bondad de ajuste, GFT (%)")
+    axE.set_title("(e) Evaluación del método GFT")
+
+    axE.legend(fontsize=8)
+    axE.grid(True, alpha=0.25)
+
+    # (f)
+    axF.plot(resultados_df["Mc"], resultados_df["b"],
+             color="tab:purple", marker="o", markersize=3.5,
+             linewidth=1.7, label="b(Mc)")
+    for m in metodos_graficar:
+        fila = resultados_df.loc[np.isclose(resultados_df["Mc"], m["Mc"])]
+        if fila.empty:
+            continue
+        axF.scatter(m["Mc"], float(fila.iloc[0]["b"]),
+                    color=m["color"], marker="D", s=75, zorder=5,
+                    edgecolor="white", linewidth=1.2,
+                    label=m["etiqueta"])
+    axF.set_xlabel("Magnitud de completitud, Mc")
+    axF.set_ylabel("Parámetro b")
+    axF.set_title("(f) Estabilidad de b y métodos de Mc")
+    axF.legend(ncol=1, fontsize=7)
+    axF.grid(True, alpha=0.25)
+
+    Mc_MAXC        = next((m["Mc"] for m in metodos_graficar if m["nombre"] == "MAXC"), np.nan)
+    Mc_GFT         = next((m["Mc"] for m in metodos_graficar if m["nombre"] == "GFT"), np.nan)
+    Mc_ESTABILIDAD = next((m["Mc"] for m in metodos_graficar if m["nombre"] == "Estab.b"), np.nan)
+
+    _gft_txt   = f"GFT = {Mc_GFT:.1f}" if pd.notna(Mc_GFT) else "GFT = n/a"
+    _estab_txt = f"Estab.b = {Mc_ESTABILIDAD:.1f}" if pd.notna(Mc_ESTABILIDAD) else "Estab.b = n/a"
+
+    fig.suptitle(
+        f"Análisis de sensibilidad del modelo EMR  "
+        f"mín.SSE = {Mc_SSE:.1f}  |  mín.NLL = {Mc_NLL:.1f}  |  "
+        f"MAXC = {Mc_MAXC:.1f}  |  {_gft_txt}  |  {_estab_txt}",
+        fontsize=12, y=0.998
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+    nombre_fig = carpeta_salida / f"EMR_Figura_{ruta_excel.stem}.png"
+    fig.savefig(nombre_fig, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Figura individual guardada: {nombre_fig}")
+
+
+# ============================================================
+# BUCLE PRINCIPAL
+# ============================================================
+lista_resumen = []
+lista_parametros = []
+archivos_ok = []
+archivos_error = []
+lista_comparativa = []
+
+for i in range(1, N_ARCHIVOS + 1):
+    ruta = CARPETA / PATRON.format(i)
+    if not ruta.exists():
+        print(f"\n[!] No existe: {ruta}  →  se omite.")
+        archivos_error.append((ruta.name, "no existe"))
+        continue
+
+    try:
+        res = procesar_archivo(ruta)
+        lista_resumen.append(res["resumen_metodos"])
+        lista_parametros.append(res["tabla_parametros"])
+        lista_comparativa.append(res["tabla_comparativa"])
+        archivos_ok.append(ruta.name)
+
+        try:
+            generar_figura_individual(res, ruta, CARPETA_FIGURAS)
+        except Exception as e_fig:
+            print(f"  [Aviso] No se pudo generar figura individual "
+                  f"para {ruta.name}: {e_fig}")
+
+    except Exception as e:
+        print(f"\n[ERROR] {ruta.name}: {e}")
+        archivos_error.append((ruta.name, str(e)))
+
+
+# ============================================================
+# CONSOLIDAR Y EXPORTAR EXCEL
+# ============================================================
+if not lista_parametros:
+    raise RuntimeError("Ningún archivo se procesó correctamente.")
+
+df_resumen_total    = pd.concat(lista_resumen, ignore_index=True)
+df_parametros_total = pd.concat(lista_parametros, ignore_index=True)
+
+# Tabla comparativa de los métodos de Mc para todas las zonas
+df_comparativa_total = pd.concat(
+    lista_comparativa,
+    ignore_index=True
+)
+
+# Ordenar por número de zona
+df_comparativa_total["Numero_Zona"] = (
+    df_comparativa_total["Zona"]
+    .str.extract(r"(\d+)")
+    .astype(float)
+)
+
+df_comparativa_total = (
+    df_comparativa_total
+    .sort_values("Numero_Zona")
+    .drop(columns="Numero_Zona")
+    .reset_index(drop=True)
+)
+
+print("\n" + "=" * 100)
+print("TABLA COMPARATIVA DE MAGNITUD DE COMPLETITUD - 13 ZONAS")
+print("=" * 100)
+
+print(
+    df_comparativa_total.to_string(
+        index=False,
+        float_format=lambda x: f"{x:.3f}"
+    )
+)
+
+print("\n" + "=" * 80)
+print("TABLA CONSOLIDADA DE PARAMETROS SISMICOS")
+print("=" * 80)
+
+df_show = df_parametros_total[[
+    "Archivo", "Mc", "a", "b", "beta", "lambda", "Nc", "T_obs_anios"
+]].copy()
+print(df_show.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+
+nombre_excel = "Parametros_Sismicos_Todos.xlsx"
+
+columnas_principales = ["Archivo", "Mc", "a", "b", "beta", "lambda",
+                        "Nc", "T_obs_anios", "mu", "sigma",
+                        "N_eventos", "M_min", "M_max", "Metodo_Mc"]
+df_parametros_total = df_parametros_total[columnas_principales]
+
+with pd.ExcelWriter(nombre_excel, engine="openpyxl") as writer:
+    df_parametros_total.to_excel(
+        writer, sheet_name="Parametros_Sismicos", index=False
+    )
+    df_resumen_total.to_excel(
+        writer, sheet_name="Candidatas_Mc", index=False
+    )
+    df_comparativa_total.to_excel(
+        writer, sheet_name="Comparacion_Mc_13_Zonas", index=False
+    )
+
+print(f"\nExcel consolidado guardado: {nombre_excel}")
+
+if archivos_error:
+    print("\nArchivos con problemas:")
+    for nom, err in archivos_error:
+        print(f"  - {nom}: {err}")
+
+print("\n===== FIN DEL ANALISIS BATCH =====")
